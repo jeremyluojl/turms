@@ -29,6 +29,7 @@ import java.util.stream.Collectors;
 import jakarta.annotation.Nullable;
 
 import com.mongodb.ClientSessionOptions;
+import com.mongodb.MongoCommandException;
 import com.mongodb.MongoNamespace;
 import com.mongodb.TransactionOptions;
 import com.mongodb.client.model.Accumulators;
@@ -607,16 +608,42 @@ public class TurmsMongoOperations implements MongoOperationsSupport {
             return Mono.empty();
         }
         MongoCollection<T> collection = context.getCollection(clazz);
-        Publisher<String> source = collection.createIndexes(indexModels);
         String collectionName = context.getEntity(clazz)
                 .collectionName();
-        return Flux.from(source)
+        return Flux.from(collection.createIndexes(indexModels))
                 .then()
-                .onErrorMap(t -> new RuntimeException(
-                        "Failed to index the collection: \""
-                                + collectionName
-                                + "\"",
-                        t))
+                .onErrorResume(t -> {
+                    if (!(t instanceof MongoCommandException e) || e.getErrorCode() != 303) {
+                        return Mono.error(new RuntimeException(
+                                "Failed to index the collection: \""
+                                        + collectionName
+                                        + "\"",
+                                t));
+                    }
+                    // Some deployments do not support hashed indexes (error code 303:
+                    // "Index type not supported: hashed"). Downgrade all hashed keys
+                    // to range (1) — sufficient for equality queries without sharding.
+                    List<IndexModel> downgraded = downgradeHashedIndexes(indexModels);
+                    if (downgraded == indexModels) {
+                        // No hashed keys found; 303 from an unrelated cause.
+                        return Mono.error(new RuntimeException(
+                                "Failed to index the collection: \""
+                                        + collectionName
+                                        + "\"",
+                                t));
+                    }
+                    LOGGER.warn(
+                            "Hashed indexes are not supported by this deployment; "
+                                    + "downgrading to range indexes for collection \"{}\"",
+                            collectionName);
+                    return Flux.from(collection.createIndexes(downgraded))
+                            .then()
+                            .onErrorMap(t2 -> new RuntimeException(
+                                    "Failed to index the collection: \""
+                                            + collectionName
+                                            + "\"",
+                                    t2));
+                })
                 .doOnSuccess(ignored -> {
                     List<BsonDocument> indexDocs = indexModels.stream()
                             .map(indexModel -> indexModel.getKeys()
@@ -625,6 +652,34 @@ public class TurmsMongoOperations implements MongoOperationsSupport {
                     String indexes = StringUtils.join(indexDocs, ", ");
                     LOGGER.info("Indexed the collection \"{}\": {}", collectionName, indexes);
                 });
+    }
+
+    private static List<IndexModel> downgradeHashedIndexes(List<IndexModel> models) {
+        boolean anyHashed = false;
+        List<IndexModel> result = new ArrayList<>(models.size());
+        for (IndexModel model : models) {
+            BsonDocument keys = model.getKeys()
+                    .toBsonDocument();
+            BsonDocument rewritten = new BsonDocument();
+            boolean changed = false;
+            for (Map.Entry<String, BsonValue> entry : keys.entrySet()) {
+                if (BsonPool.BSON_STRING_HASHED.equals(entry.getValue())) {
+                    rewritten.append(entry.getKey(), BsonPool.BSON_INT32_1);
+                    changed = true;
+                    anyHashed = true;
+                } else {
+                    rewritten.append(entry.getKey(), entry.getValue());
+                }
+            }
+            result.add(changed
+                    ? new IndexModel(rewritten, model.getOptions())
+                    : model);
+        }
+        // Return the original reference when nothing changed so the caller can
+        // detect that no hashed keys were present (used to propagate the error).
+        return anyHashed
+                ? result
+                : models;
     }
 
     @Override
@@ -679,11 +734,17 @@ public class TurmsMongoOperations implements MongoOperationsSupport {
         Publisher<Document> source = context.getAdminDatabase()
                 .runCommand(new Document("enableSharding", dbName));
         return Mono.from(source)
-                .onErrorMap(t -> new RuntimeException(
-                        "Failed to enable sharding the database: \""
-                                + dbName
-                                + "\"",
-                        t))
+                .onErrorResume(t -> {
+                    if (t instanceof MongoCommandException e && e.getErrorCode() == 303) {
+                        // "Feature not supported: enableSharding" — non-sharded deployment (e.g. DocumentDB)
+                        return Mono.empty();
+                    }
+                    return Mono.error(new RuntimeException(
+                            "Failed to enable sharding the database: \""
+                                    + dbName
+                                    + "\"",
+                            t));
+                })
                 .doOnSuccess(
                         ignored -> LOGGER.info("Enabled sharding the database: \"{}\"", dbName))
                 .then();
@@ -699,12 +760,18 @@ public class TurmsMongoOperations implements MongoOperationsSupport {
         Document command = new Document("shardCollection", namespace).append("key", shardKey);
         Mono<Document> shardCollection = Mono.from(context.getAdminDatabase()
                 .runCommand(command))
-                .onErrorMap(t -> new RuntimeException(
-                        "Failed to shard the collection \""
-                                + namespace
-                                + "\" with the shard key: "
-                                + shardKey.toJson(),
-                        t))
+                .onErrorResume(t -> {
+                    if (t instanceof MongoCommandException e && e.getErrorCode() == 303) {
+                        // "Feature not supported: shardCollection" — non-sharded deployment (e.g. DocumentDB)
+                        return Mono.empty();
+                    }
+                    return Mono.error(new RuntimeException(
+                            "Failed to shard the collection \""
+                                    + namespace
+                                    + "\" with the shard key: "
+                                    + shardKey.toJson(),
+                            t));
+                })
                 .doOnSuccess(ignored -> LOGGER.info(
                         "Sharded the collection \"{}\" with the shard key: {}",
                         namespace,

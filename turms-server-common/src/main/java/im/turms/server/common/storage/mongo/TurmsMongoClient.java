@@ -139,6 +139,14 @@ public final class TurmsMongoClient implements MongoOperationsSupport {
                 .collect(CollectorUtil.toList(pairs.size()));
     }
 
+    public boolean isShardedCluster() {
+        List<ServerDescription> descs = descriptions;
+        if (descs == null || descs.isEmpty()) {
+            return false;
+        }
+        return descs.getFirst().getClusterType() == ClusterType.SHARDED;
+    }
+
     public void verifyClusterTypes(String name, Set<ClusterType> requiredClusterTypes) {
         if (descriptions == null) {
             throw new IllegalStateException(

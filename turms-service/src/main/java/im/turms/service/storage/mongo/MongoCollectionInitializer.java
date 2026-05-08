@@ -210,18 +210,22 @@ public class MongoCollectionInitializer implements IMongoCollectionInitializer {
                         t -> new MongoInitializationException("Failed to create collections", t))
                 .doOnSuccess(ignored -> LOGGER.info("All collections are created"))
                 .flatMap(exists -> {
-                    if (exists && !fakeDataGenerator.isFakeIfCollectionExists()) {
-                        return Mono.empty();
-                    }
-                    return Mono.defer(() -> ensureZones()
+                    // ensureIndexesAndShards runs unconditionally: createIndex is idempotent
+                    // (no-op when the index already exists), so it is safe to call on every
+                    // startup. Previously the whole block was skipped when all collections
+                    // already existed, which prevented index creation from recovering after
+                    // a partial failure on first startup.
+                    boolean shouldPopulateFakeData = !context.isProduction()
+                            && fakeDataGenerator.isFakingEnabled()
+                            && (!exists || fakeDataGenerator.isFakeIfCollectionExists());
+                    return ensureZones()
                             .then(Mono.defer(this::ensureIndexesAndShards)
                                     .onErrorMap(t -> new MongoInitializationException(
                                             "Failed to ensure indexes and shards",
                                             t)))
-                            .then(Mono.defer(() -> !context.isProduction()
-                                    && fakeDataGenerator.isFakingEnabled()
-                                            ? fakeDataGenerator.populateCollectionsWithFakeData()
-                                            : Mono.empty())));
+                            .then(Mono.defer(() -> shouldPopulateFakeData
+                                    ? fakeDataGenerator.populateCollectionsWithFakeData()
+                                    : Mono.empty()));
                 });
         try {
             createCollections.block(DurationConst.ONE_MINUTE);
@@ -431,6 +435,9 @@ public class MongoCollectionInitializer implements IMongoCollectionInitializer {
                 continue;
             }
             TurmsMongoClient client = entry.getValue();
+            if (!client.isShardedCluster()) {
+                continue;
+            }
             for (MongoEntity<?> entity : client.getRegisteredEntities()) {
                 String collectionName = entity.collectionName();
                 Zone zone = entity.zone();

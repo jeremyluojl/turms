@@ -82,7 +82,7 @@ public class MongoConfig extends BaseMongoConfig {
                 .getUser();
         TurmsMongoClient mongoClient = getMongoClient(properties,
                 "user",
-                Set.of(ClusterType.SHARDED, ClusterType.LOAD_BALANCED));
+                Set.of(ClusterType.SHARDED, ClusterType.LOAD_BALANCED, ClusterType.REPLICA_SET));
         mongoClient.registerEntitiesByClasses(User.class);
         return mongoClient;
     }
