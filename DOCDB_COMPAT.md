@@ -257,26 +257,73 @@ DocumentDB 8.0 支持多文档 ACID 事务，无需修改代码。
 
 ---
 
-### 4.2 DocumentDB 纯 DB 层延迟（VPC 内直连）
+### 4.2 DocumentDB 并发压测（VPC 内直连，r8g.large）
 
-**环境：** EC2 pymongo 直连 DocumentDB writer，VPC 内同 region，无应用层开销。每场景 500 次请求（含 10 次 warmup），数据集 100,051 条 message 文档。
+#### 测试方法
 
-| 查询 | 执行计划 | p50 | p95 | p99 | avg |
+| 项目 | 说明 |
+|---|---|
+| **实例** | DocumentDB `db.r8g.large` × 2（1 writer + 1 reader），VPC 内同 region |
+| **工具** | Python Motor（asyncio 异步 pymongo），EC2 直连，无应用层开销 |
+| **请求数** | 每场景 5,000 次（p99 有 50 个样本，统计稳定） |
+| **Warmup** | 每场景正式计时前先执行 25 次 warmup 请求 |
+| **数据集** | 100,051 条 message 文档 |
+| **读操作** | 用户主键查询、用户关系列表（`oid` 索引）、群成员列表（`gid` 索引）各占 1/3，随机选取 |
+| **写操作** | insert + delete 单条 message（保持数据集大小不变） |
+
+**Caveat：**
+- 所有查询使用固定 sample ID，warmup 后该页常驻 buffer pool，测的是 **100% hot cache** 场景，实际生产请求分散时延迟略高。
+- 写延迟包含 insert + delete 两步，比纯 insert 偏高约 1 倍。
+
+---
+
+#### Section 1：并发梯度（纯读，writer endpoint）
+
+| 并发数 | RPS | p50 | p95 | p99 | avg |
 |---|---|---|---|---|---|
-| 用户主键 PK lookup | IXSCAN | 1.4ms | 2.6ms | 6.3ms | 1.6ms |
-| 过期消息清理 `dd` | IXSCAN | 1.2ms | 2.8ms | 14.6ms | 1.6ms |
-| 用户关系 `oid` 索引 | IXSCAN | 1.5ms | 3.2ms | 7.2ms | 1.7ms |
-| 群成员 `gid` 索引 | IXSCAN | 1.4ms | 2.4ms | 4.6ms | 1.5ms |
-| 消息时间范围 `dyd` 单键 | IXSCAN | 1.9ms | 4.9ms | 11.5ms | 2.3ms |
-| estimated_document_count | — | 1.5ms | 4.6ms | 9.5ms | 1.9ms |
-| 消息历史 `dyd+tid` 复合索引（范围扫描 limit 50） | IXSCAN | 21.4ms | 47.9ms | 88.0ms | 26.5ms |
-| **发送者 `sid`（无索引，COLLSCAN 对照）** | **COLLSCAN** | **364ms** | **688ms** | **1,448ms** | **413ms** |
+| 1 | 316 | 2.3 ms | 7.1 ms | 12.6 ms | 3.2 ms |
+| 10 | 1,072 | 7.9 ms | 18.3 ms | **36.8 ms** | 9.2 ms |
+| 50 | 1,341 | 35.9 ms | 58.6 ms | 70.6 ms | 36.9 ms |
+| 100 | 1,306 | 74.9 ms | 100.2 ms | 116.9 ms | 75.7 ms |
 
-**说明：**
+- 吞吐峰值约 **1,340 RPS**，concurrency=50 达到饱和，100 无继续增长
+- 甜点区：**concurrency=10**，RPS=1,072，p99=36.8ms
 
-1. **所有 IXSCAN 查询 p50 均在 1–21ms**，之前端到端压测中 300–400ms 的延迟几乎全部来自公网 RTT 和 Turms rate limit 排队，DB 本身仅贡献 2–21ms。
-2. **消息历史 p50=21ms 偏高**：该查询为跨 30 天时间范围的范围扫描并返回 50 条，比点查多了顺序 IO，属预期。
-3. **COLLSCAN vs IXSCAN 差距 17–250 倍**：sid 无索引时 p50=364ms，IXSCAN 点查 p50=1.4ms，直观验证索引必要性。`sid` 字段无 Admin API 查询路径，COLLSCAN 为预期行为，无需添加索引。
+---
+
+#### Section 2：读写混合（80R/20W，writer endpoint）
+
+| 并发数 | 80R/20W RPS | 纯读 RPS | 80R/20W p50 | 纯读 p50 | 80R/20W p99 | 纯读 p99 |
+|---|---|---|---|---|---|---|
+| 1 | 186 | 296 | 2.9 ms | 2.3 ms | 25.7 ms | 15.8 ms |
+| 10 | 766 | 1,080 | 7.9 ms | 7.9 ms | 74.7 ms | 33.9 ms |
+| 50 | 832 | 1,248 | 44.8 ms | 38.0 ms | 273 ms | 81.3 ms |
+| 100 | 833 | 1,221 | 92.8 ms | 77.3 ms | 419 ms | 165.5 ms |
+
+- 写操作使整体吞吐降低约 **33%**，p50 影响极小，代价主要体现在 **p99 约增加 2–3 倍**（写入触发 journal flush 的偶发性卡顿）
+- 80R/20W 饱和点同样在 concurrency=50，超过后 RPS 不增、p99 继续劣化
+
+---
+
+#### Section 3：Writer vs Reader endpoint（concurrency=50，纯读）
+
+| endpoint | RPS | p50 | p95 | p99 |
+|---|---|---|---|---|
+| writer | 1,145 | 40.5 ms | 75.7 ms | 116.8 ms |
+| reader | 1,198 | 38.8 ms | 68.2 ms | 101.6 ms |
+
+两者基本持平（p50 差 1.7ms）。Read Replica 的优势在 writer 被大量写操作占满时才显著，纯读场景下路由开销抵消了分流收益。
+
+---
+
+#### 与 t3.medium 对比（concurrency=50，纯读）
+
+| 指标 | t3.medium | r8g.large | 提升 |
+|---|---|---|---|
+| 最高 RPS | ~169 | ~1,341 | **7.9×** |
+| p50 | 286.9 ms | 35.9 ms | **8×** |
+| p99 | 2,879 ms | 70.6 ms | **41×** |
+| 并发饱和点 | ~10 | ~50 | **5×** |
 
 ---
 
