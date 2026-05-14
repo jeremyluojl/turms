@@ -236,7 +236,9 @@ DocumentDB 8.0 支持多文档 ACID 事务，无需修改代码。
 
 ## 四、压测结果
 
-**环境：** EC2 `c5.xlarge`（turms-service 2GB mem limit）→ DocumentDB `db.t3.medium` × 2（1 writer + 1 reader），VPC 内同 region。测试工具：Python httpx，并发 20，共 500 请求，通过 Admin API（port 8510）。
+### 4.1 Admin API 端到端压测
+
+**环境：** 本地 MacBook → 公网 → EC2 `c5.xlarge`（turms-service 2GB mem limit）→ VPC 内 → DocumentDB `db.t3.medium` × 2。测试工具：Python httpx，并发 20，共 500 请求，通过 Admin API（port 8510）。
 
 | 场景 | RPS | p50 | p95 | p99 | 429 限流率 |
 |---|---|---|---|---|---|
@@ -250,12 +252,31 @@ DocumentDB 8.0 支持多文档 ACID 事务，无需修改代码。
 **说明：**
 
 1. **429 限流**：来自 Turms Admin API 的 rate limit（dev 配置默认限速），非 DB 瓶颈。排除 429 后实际 200 请求的延迟更低。
+2. **公网 RTT 是主要开销**：本机 → 东京 EC2 单程约 60–80ms，来回 120–160ms，是端到端延迟的最大贡献者，非 DB 瓶颈。
+3. **tiered storage 在 DocumentDB 上已正确跳过**：非分片集群检测到后直接 continue，不触发任何 `addShardToZone`/`balancerStatus` 调用，启动日志无 error 303。
 
-2. **DB 查询开销**：索引查询比 health 基线多约 50–80ms（p50），为 VPC 内 DocumentDB `t3.medium` 的正常响应时间，跨 AZ 通信引入额外 1–3ms。
+---
 
-3. **索引效果显著**：若走 COLLSCAN 扫描 100k 文档，p50 预计 >2s；实测 p50 386ms 证明索引生效，DB 开销处于预期范围内。
+### 4.2 DocumentDB 纯 DB 层延迟（VPC 内直连）
 
-4. **tiered storage 在 DocumentDB 上已正确跳过**：非分片集群检测到后直接 continue，不触发任何 `addShardToZone`/`balancerStatus` 调用，启动日志无 error 303。
+**环境：** EC2 pymongo 直连 DocumentDB writer，VPC 内同 region，无应用层开销。每场景 500 次请求（含 10 次 warmup），数据集 100,051 条 message 文档。
+
+| 查询 | 执行计划 | p50 | p95 | p99 | avg |
+|---|---|---|---|---|---|
+| 用户主键 PK lookup | IXSCAN | 1.4ms | 2.6ms | 6.3ms | 1.6ms |
+| 过期消息清理 `dd` | IXSCAN | 1.2ms | 2.8ms | 14.6ms | 1.6ms |
+| 用户关系 `oid` 索引 | IXSCAN | 1.5ms | 3.2ms | 7.2ms | 1.7ms |
+| 群成员 `gid` 索引 | IXSCAN | 1.4ms | 2.4ms | 4.6ms | 1.5ms |
+| 消息时间范围 `dyd` 单键 | IXSCAN | 1.9ms | 4.9ms | 11.5ms | 2.3ms |
+| estimated_document_count | — | 1.5ms | 4.6ms | 9.5ms | 1.9ms |
+| 消息历史 `dyd+tid` 复合索引（范围扫描 limit 50） | IXSCAN | 21.4ms | 47.9ms | 88.0ms | 26.5ms |
+| **发送者 `sid`（无索引，COLLSCAN 对照）** | **COLLSCAN** | **364ms** | **688ms** | **1,448ms** | **413ms** |
+
+**说明：**
+
+1. **所有 IXSCAN 查询 p50 均在 1–21ms**，之前端到端压测中 300–400ms 的延迟几乎全部来自公网 RTT 和 Turms rate limit 排队，DB 本身仅贡献 2–21ms。
+2. **消息历史 p50=21ms 偏高**：该查询为跨 30 天时间范围的范围扫描并返回 50 条，比点查多了顺序 IO，属预期。
+3. **COLLSCAN vs IXSCAN 差距 17–250 倍**：sid 无索引时 p50=364ms，IXSCAN 点查 p50=1.4ms，直观验证索引必要性。`sid` 字段无 Admin API 查询路径，COLLSCAN 为预期行为，无需添加索引。
 
 ---
 

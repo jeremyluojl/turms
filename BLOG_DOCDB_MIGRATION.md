@@ -260,16 +260,9 @@ hashed index 降级为 range(1) 后，查询效率未受任何影响，索引使
 
 ## 五、性能压测
 
-### 测试环境
+### 5.1 Admin API 端到端压测
 
-| 组件 | 规格 |
-|---|---|
-| **turms-service** | EC2 `c5.xlarge`（4 vCPU / 8 GB），JVM 内存限制 2 GB |
-| **DocumentDB** | `db.t3.medium` × 2（1 writer + 1 reader），同 Region VPC 内 |
-| **测试工具** | Python `httpx`，并发 20，共 500 请求 |
-| **接口** | Admin API（端口 8510） |
-
-### 压测结果
+**环境：** 本地 MacBook → 公网 → EC2 `c5.xlarge`（turms-service，JVM 2 GB）→ VPC 内 → DocumentDB `db.t3.medium` × 2。Python `httpx`，并发 20，共 500 请求，Admin API（端口 8510）。
 
 | 测试场景 | RPS | p50 延迟 | p95 延迟 | p99 延迟 | 429 限流率 |
 |---|---|---|---|---|---|
@@ -280,15 +273,34 @@ hashed index 降级为 range(1) 后，查询效率未受任何影响，索引使
 | 群成员 `gid` 索引 | 57.4 | 310 ms | 595 ms | 731 ms | 20% |
 | 用户主键 PK 查询 | 62.7 | 302 ms | 494 ms | 585 ms | 22% |
 
+> 端到端延迟的主要贡献是**公网 RTT**（本机 → 东京 EC2 单程约 60–80 ms）和 Turms Admin API rate limit 排队，DB 本身仅贡献 2–21 ms（见 5.2 节）。
+
+---
+
+### 5.2 DocumentDB 纯 DB 层延迟（VPC 内直连）
+
+**环境：** EC2 上 pymongo 直连 DocumentDB writer，完全消除公网 RTT 和应用层开销。每场景 500 次请求（10 次 warmup），数据集 100,051 条 message 文档。
+
+| 查询 | 执行计划 | p50 | p95 | p99 | avg |
+|---|---|---|---|---|---|
+| 用户主键 PK lookup | IXSCAN | 1.4 ms | 2.6 ms | 6.3 ms | 1.6 ms |
+| 过期消息清理 `dd` | IXSCAN | 1.2 ms | 2.8 ms | 14.6 ms | 1.6 ms |
+| 用户关系 `oid` 索引 | IXSCAN | 1.5 ms | 3.2 ms | 7.2 ms | 1.7 ms |
+| 群成员 `gid` 索引 | IXSCAN | 1.4 ms | 2.4 ms | 4.6 ms | 1.5 ms |
+| 消息时间范围 `dyd` 单键 | IXSCAN | 1.9 ms | 4.9 ms | 11.5 ms | 2.3 ms |
+| estimated_document_count | — | 1.5 ms | 4.6 ms | 9.5 ms | 1.9 ms |
+| 消息历史 `dyd+tid` 复合索引（范围扫描 limit 50） | IXSCAN | 21.4 ms | 47.9 ms | 88.0 ms | 26.5 ms |
+| **发送者 `sid`（无索引，COLLSCAN 对照）** | **COLLSCAN** | **364 ms** | **688 ms** | **1,448 ms** | **413 ms** |
+
 ### 结果解读
 
-1. **429 限流来自 Turms 本身**，非 DB 瓶颈。Turms dev 配置对 Admin API 有默认限速，排除 429 后实际 200 请求的延迟更低。
+1. **所有 IXSCAN 查询 p50 均在 1–21 ms**，`db.t3.medium` DocumentDB 本身响应极快，端到端 300–400 ms 的延迟几乎全部来自公网 RTT 和 rate limit 排队，与 DB 无关。
 
-2. **DB 查询相比基线多 50–80 ms（p50）**，这是 VPC 内 DocumentDB `t3.medium` 的正常响应时间（跨 AZ 额外引入 1–3 ms）。
+2. **消息历史 p50=21 ms 偏高**：该查询为跨 30 天时间范围的范围扫描并返回 50 条，比点查多了顺序 IO，属预期。
 
-3. **索引效果显著**：若走 COLLSCAN 扫描 100k 文档，p50 预计 >2,000 ms；实测 p50 386 ms 证明索引完全生效，DB 开销处于预期范围内。
+3. **COLLSCAN vs IXSCAN 差距 17–250 倍**：`sid` 无索引时 p50=364 ms，IXSCAN 点查 p50=1.4 ms，直观验证索引必要性。`sid` 字段无对应 Admin API 查询路径，COLLSCAN 为预期行为。
 
-4. **hashed → range 降级无性能损失**：所有涉及降级索引的集合（群组、群成员等）查询延迟与主键查询相当，证明 range(1) 索引对等值查询同样高效。
+4. **hashed → range 降级无性能损失**：涉及降级索引的集合（群组、群成员等）p50 均在 1.4–1.5 ms，与主键查询相当，证明 range(1) 索引对等值查询同样高效。
 
 5. **功能验证全部通过**：Admin API 测试 20/20，WebSocket 端到端测试 33/33，覆盖消息收发、群组管理、好友关系、实时推送等完整业务链路。
 
