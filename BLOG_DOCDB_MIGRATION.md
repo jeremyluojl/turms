@@ -260,26 +260,7 @@ hashed index 降级为 range(1) 后，查询效率未受任何影响，索引使
 
 ## 五、性能压测
 
-### 5.1 Admin API 端到端压测
-
-**环境：** 本地 MacBook → 公网 → EC2 `c5.xlarge`（turms-service，JVM 2 GB）→ VPC 内 → DocumentDB `db.t3.medium` × 2。Python `httpx`，并发 20，共 500 请求，Admin API（端口 8510）。
-
-| 测试场景 | RPS | p50 延迟 | p95 延迟 | p99 延迟 | 429 限流率 |
-|---|---|---|---|---|---|
-| Health Check（无 DB，基线） | 60.4 | 314 ms | 567 ms | 703 ms | 16% |
-| 消息历史 `dyd+tid` 复合索引 | 46.8 | 386 ms | 745 ms | 1,422 ms | 1% |
-| 消息时间范围 `dyd` 索引 | 50.7 | 367 ms | 678 ms | 816 ms | 4% |
-| 用户关系 `oid` 索引 | 54.6 | 339 ms | 585 ms | 687 ms | 12% |
-| 群成员 `gid` 索引 | 57.4 | 310 ms | 595 ms | 731 ms | 20% |
-| 用户主键 PK 查询 | 62.7 | 302 ms | 494 ms | 585 ms | 22% |
-
-> 端到端延迟的主要贡献是**公网 RTT**（本机 → 东京 EC2 单程约 60–80 ms）和 Turms Admin API rate limit 排队，DB 本身仅贡献 2–21 ms（见 5.2 节）。
-
----
-
-### 5.2 DocumentDB 纯 DB 层延迟（VPC 内直连）
-
-**环境：** EC2 上 pymongo 直连 DocumentDB writer，完全消除公网 RTT 和应用层开销。每场景 500 次请求（10 次 warmup），数据集 100,051 条 message 文档。
+**环境：** EC2 上 pymongo 直连 DocumentDB writer（VPC 内，消除公网 RTT 和应用层开销）。每场景 500 次请求（10 次 warmup），数据集 100,051 条 message 文档，DocumentDB `db.t3.medium` × 2（1 writer + 1 reader）。
 
 | 查询 | 执行计划 | p50 | p95 | p99 | avg |
 |---|---|---|---|---|---|
@@ -294,9 +275,9 @@ hashed index 降级为 range(1) 后，查询效率未受任何影响，索引使
 
 ### 结果解读
 
-1. **所有 IXSCAN 查询 p50 均在 1–21 ms**，`db.t3.medium` DocumentDB 本身响应极快，端到端 300–400 ms 的延迟几乎全部来自公网 RTT 和 rate limit 排队，与 DB 无关。
+1. **所有 IXSCAN 查询 p50 均在 1–21 ms**，`db.t3.medium` 对当前数据规模（10 万条）完全够用。
 
-2. **消息历史 p50=21 ms 偏高**：该查询为跨 30 天时间范围的范围扫描并返回 50 条，比点查多了顺序 IO，属预期。
+2. **消息历史 p50=21 ms 偏高**：该查询为跨时间范围的范围扫描并返回 50 条，比点查多了顺序 IO，属预期。
 
 3. **COLLSCAN vs IXSCAN 差距 17–250 倍**：`sid` 无索引时 p50=364 ms，IXSCAN 点查 p50=1.4 ms，直观验证索引必要性。`sid` 字段无对应 Admin API 查询路径，COLLSCAN 为预期行为。
 
